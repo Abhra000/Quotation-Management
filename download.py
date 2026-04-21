@@ -85,7 +85,7 @@ def read_policies():
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Sheet1"
-        for i, h in enumerate(["Policy Number","Engine Number","Chassis Number","Proposal Number","Status"], 1):
+        for i, h in enumerate(["Policy Number","Registration Number","Engine Number","Chassis Number","Proposal Number","Policy Start Date","Policy End Date","Status"], 1):
             ws.cell(1, i, h)
         wb.save(EXCEL_PATH)
         print(f"  Created: {EXCEL_PATH}  — fill in Policy Numbers and run again.")
@@ -96,7 +96,7 @@ def read_policies():
     ws = wb.active
 
     headers = {}
-    for col in range(1, 10):
+    for col in range(1, 13):
         v = ws.cell(1, col).value
         if v:
             headers[str(v).strip().lower()] = col
@@ -106,18 +106,18 @@ def read_policies():
         pn = ws.cell(row, headers.get("policy number", 1)).value
         if not pn or not str(pn).strip():
             continue
-        status = str(ws.cell(row, headers.get("status", 5)).value or "").strip().lower()
+        status = str(ws.cell(row, headers.get("status", 7)).value or "").strip().lower()
         if status == "downloaded":
             continue
         policies.append({
             "row":             row,
             "policy_number":   str(pn).strip(),
-            "status_col":      headers.get("status", 5),
+            "status_col":      headers.get("status", 8),
         })
     return policies
 
 
-def update_row(row, status_col, status, engine="", chassis="", proposal=""):
+def update_row(row, status_col, status, registration="", engine="", chassis="", proposal="", policy_start="", policy_end=""):
     """Write status + scraped data back to Excel row.
     Uses a temp-file-then-replace strategy to prevent corruption:
     always writes to policy.xlsx.tmp first, then renames over the original.
@@ -131,23 +131,29 @@ def update_row(row, status_col, status, engine="", chassis="", proposal=""):
             ws = wb.active
             # Find header columns
             headers = {}
-            for col in range(1, 10):
+            for col in range(1, 13):
                 v = ws.cell(1, col).value
                 if v:
                     headers[str(v).strip().lower()] = col
             ws.cell(row=row, column=status_col, value=status)
             # Always write all fields — prevents previous row values carrying over
-            ws.cell(row=row, column=headers.get("engine number",   2), value=engine   or "")
-            ws.cell(row=row, column=headers.get("chassis number",  3), value=chassis  or "")
-            ws.cell(row=row, column=headers.get("proposal number", 4), value=proposal or "")
+            ws.cell(row=row, column=headers.get("registration number", 2), value=registration or "")
+            ws.cell(row=row, column=headers.get("engine number",       3), value=engine       or "")
+            ws.cell(row=row, column=headers.get("chassis number",      4), value=chassis      or "")
+            ws.cell(row=row, column=headers.get("proposal number",     5), value=proposal     or "")
+            ws.cell(row=row, column=headers.get("policy start date",   6), value=policy_start or "")
+            ws.cell(row=row, column=headers.get("policy end date",     7), value=policy_end   or "")
             # Save to temp file first — if this crashes the original is safe
             wb.save(str(tmp_path))
             # Only replace original once temp is fully written
             shutil.move(str(tmp_path), str(EXCEL_PATH))
             log("ok", f"Excel updated -> row {row}: status='{status}'"
-                + (f" engine={engine}"   if engine   else "")
-                + (f" chassis={chassis}" if chassis  else "")
-                + (f" proposal={proposal}" if proposal else ""))
+                + (f" reg={registration}"        if registration else "")
+                + (f" engine={engine}"           if engine       else "")
+                + (f" chassis={chassis}"         if chassis      else "")
+                + (f" proposal={proposal}"       if proposal     else "")
+                + (f" start={policy_start}"      if policy_start else "")
+                + (f" end={policy_end}"          if policy_end   else ""))
             return
         except PermissionError:
             log("warn", "  Excel is open — close policy.xlsx and press ENTER")
@@ -183,9 +189,27 @@ async def download_policy_pdf(page, policy, is_first=True):
         #     appear within 3s we click Motor again (click may not have landed).
         log("info", "Clicking Motor and waiting for Nysa Policies tab...")
         nysa_tab_visible = False
+        # Helper: run a page.evaluate but swallow "Execution context was destroyed"
+        # errors. After the Motor click the SPA navigates, which tears down the JS
+        # context; the next evaluate on this page must not bubble up an exception
+        # — we just treat it as "not ready yet" and let the loop retry.
+        async def safe_eval(js, *args):
+            try:
+                if args:
+                    return await page.evaluate(js, *args)
+                return await page.evaluate(js)
+            except Exception as _e:
+                msg = str(_e).lower()
+                if ("execution context was destroyed" in msg
+                    or "navigation" in msg
+                    or "target closed" in msg
+                    or "frame was detached" in msg):
+                    return None
+                raise
+
         for _m in range(30):
             # Check if Nysa Policies already visible — if yes, no need to click
-            nysa_tab_visible = await page.evaluate("""() => {
+            nysa_tab_visible = await safe_eval("""() => {
                 for (const el of document.querySelectorAll('*')) {
                     if ((el.innerText||el.textContent||'').trim() === 'Nysa Policies') {
                         return el.getBoundingClientRect().width > 0;
@@ -196,11 +220,20 @@ async def download_policy_pdf(page, policy, is_first=True):
             if nysa_tab_visible:
                 log("ok", f"  -> Nysa Policies tab visible (attempt {_m+1})")
                 break
+            # If safe_eval returned None (context destroyed), wait for the page
+            # to settle and retry the outer loop.
+            if nysa_tab_visible is None:
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(400)
+                continue
 
             # Find the smallest element with exact text "Motor" — avoids
             # matching parent cards that contain extra child text.
             # Scroll it into view first so mouse.click lands correctly.
-            mc = await page.evaluate("""() => {
+            mc = await safe_eval("""() => {
                 let best = null, bestArea = Infinity;
                 for (const el of document.querySelectorAll('*')) {
                     const t = (el.innerText||el.textContent||'').trim();
@@ -217,12 +250,19 @@ async def download_policy_pdf(page, policy, is_first=True):
             }""")
             if mc:
                 await page.wait_for_timeout(300)   # let scroll settle
-                await page.mouse.click(mc['x'], mc['y'])
+                try:
+                    await page.mouse.click(mc['x'], mc['y'])
+                except Exception as _ce:
+                    log("info", f"  Motor click raised ({str(_ce)[:60]}) — retrying")
+                    await page.wait_for_timeout(500)
+                    continue
                 log("info", f"  Motor clicked (attempt {_m+1}), waiting for Nysa Policies tab...")
-                # Wait up to 3s for Nysa Policies tab to appear after this click
+                # Wait up to 3s for Nysa Policies tab to appear after this click.
+                # Use safe_eval — the click usually triggers an SPA navigation which
+                # destroys the JS context briefly.
                 for _w in range(6):
                     await page.wait_for_timeout(500)
-                    appeared = await page.evaluate("""() => {
+                    appeared = await safe_eval("""() => {
                         for (const el of document.querySelectorAll('*')) {
                             if ((el.innerText||el.textContent||'').trim() === 'Nysa Policies') {
                                 return el.getBoundingClientRect().width > 0;
@@ -268,10 +308,48 @@ async def download_policy_pdf(page, policy, is_first=True):
             await page.wait_for_timeout(500)
 
         try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
+            await page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
-        await page.wait_for_timeout(300)
+
+        # Wait for the Nysa Policies search form to be FULLY rendered before
+        # moving on. Simply waiting on networkidle isn't enough — the SPA can
+        # report networkidle while the search form/radio buttons are still
+        # being painted. We poll until both the "Policy Number" radio option
+        # AND the GET POLICIES button are visible. This is what makes the 1st
+        # policy behave the same as the 2nd, 3rd, etc.
+        log("info", "Waiting for Nysa Policies search form to load...")
+        form_ready = False
+        for _fr in range(40):   # up to 20s
+            form_ready = await page.evaluate("""() => {
+                // Policy Number radio label visible?
+                let has_radio = false;
+                for (const el of document.querySelectorAll('label,span')) {
+                    const t = (el.innerText||el.textContent||'').trim().toLowerCase();
+                    if (t === 'policy number' || t.includes('policy number')) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) { has_radio = true; break; }
+                    }
+                }
+                // GET POLICIES button visible?
+                let has_button = false;
+                for (const el of document.querySelectorAll('button,input[type="submit"]')) {
+                    const t = (el.innerText||el.value||'').trim().toUpperCase();
+                    if (t.includes('GET POLICIES') || t.includes('GET POLICY')) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) { has_button = true; break; }
+                    }
+                }
+                return has_radio && has_button;
+            }""")
+            if form_ready:
+                log("ok", f"  -> Nysa Policies form ready (attempt {_fr+1})")
+                break
+            await page.wait_for_timeout(500)
+        if not form_ready:
+            log("warn", "  Search form never reported ready — continuing anyway")
+        # Small settle wait after form is ready — lets event handlers attach
+        await page.wait_for_timeout(800)
     else:
         log("info", "  Skipping Motor/Nysa Policies click (already on page)")
 
@@ -388,6 +466,52 @@ async def download_policy_pdf(page, policy, is_first=True):
         update_row(policy["row"], policy["status_col"], "Not Found")
         return False
 
+    # Extra wait: the row text appeared, but the Policy PDF column cell/icon
+    # inside the row may still be mounting. Poll until the row has at least
+    # as many <td> cells as the header has <th> cells — this confirms the row
+    # is structurally complete (not a half-rendered placeholder). Also wait
+    # for networkidle to let any per-row XHRs finish.
+    log("info", "  Waiting for results row to be fully rendered...")
+    for _rr in range(30):   # up to 15s
+        row_ready = await page.evaluate("""(pno) => {
+            for (const tbl of document.querySelectorAll('table')) {
+                const ths = tbl.querySelectorAll('th');
+                if (ths.length === 0) continue;
+                const hasResultCols = Array.from(ths).some(th => {
+                    const t = (th.innerText||th.textContent||'').toLowerCase();
+                    return t.includes('engine') || t.includes('chassis');
+                });
+                if (!hasResultCols) continue;
+                const rows = Array.from(tbl.querySelectorAll('tbody tr, tr'));
+                for (const tr of rows) {
+                    const tds = tr.querySelectorAll('td');
+                    if (tds.length === 0) continue;
+                    // Check this row contains the current policy number
+                    const rowHasPolicy = Array.from(tds).some(td =>
+                        (td.textContent||'').trim().toUpperCase().includes(pno)
+                    );
+                    if (!rowHasPolicy) continue;
+                    // Row must have at least as many TDs as header has THs
+                    // (meaning all columns are rendered, not just the first few)
+                    if (tds.length >= ths.length - 1) return true;
+                }
+            }
+            return false;
+        }""", policy_no_clean)
+        if row_ready:
+            log("ok", f"  -> Row fully rendered (attempt {_rr+1})")
+            break
+        await page.wait_for_timeout(500)
+
+    # Network quiet-down after row render — important so that any per-row
+    # resource fetches (PDF icon images, tooltip JS, etc.) finish before we
+    # try to click the Policy PDF icon.
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(500)
+
     # 4b. Scrape Engine / Chassis / Proposal from the results table.
     #
     # Actual column order (from UI screenshot):
@@ -400,13 +524,15 @@ async def download_policy_pdf(page, policy, is_first=True):
     # — this avoids accidentally reading the filter/search form table.
 
     scraped = await page.evaluate("""() => {
-        const result = {engine:'', chassis:'', proposal:'', policy_in_row:'', debug:''};
+        const result = {registration:'', engine:'', chassis:'', proposal:'', policy_start:'', policy_end:'', policy_in_row:'', debug:''};
 
         function mapHeaders(cells) {
             const colMap = {};
             cells.forEach((cell, i) => {
                 const t = (cell.innerText || cell.textContent || '')
                             .replace(/\s+/g, ' ').trim().toLowerCase();
+                if (t.includes('registration'))
+                    colMap.registration = i;
                 if (t.includes('engine'))
                     colMap.engine   = i;
                 if (t.includes('chassis'))
@@ -415,6 +541,10 @@ async def download_policy_pdf(page, policy, is_first=True):
                     colMap.proposal = i;
                 if (t.includes('policy') && (t.includes('covernote') || t.includes('number')))
                     colMap.policy_no = i;
+                if (t.includes('policy') && t.includes('start') && t.includes('date'))
+                    colMap.policy_start = i;
+                if (t.includes('policy') && t.includes('end') && t.includes('date'))
+                    colMap.policy_end = i;
             });
             return colMap;
         }
@@ -428,14 +558,20 @@ async def download_policy_pdf(page, policy, is_first=True):
             for (const tr of Array.from(tbl.querySelectorAll('tr'))) {
                 const tds = Array.from(tr.querySelectorAll('td'));
                 if (tds.length === 0) continue;
-                if ('engine'    in colMap && tds[colMap.engine])
-                    result.engine        = (tds[colMap.engine].textContent    || '').trim();
-                if ('chassis'   in colMap && tds[colMap.chassis])
-                    result.chassis       = (tds[colMap.chassis].textContent   || '').trim();
-                if ('proposal'  in colMap && tds[colMap.proposal])
-                    result.proposal      = (tds[colMap.proposal].textContent  || '').trim();
-                if ('policy_no' in colMap && tds[colMap.policy_no])
-                    result.policy_in_row = (tds[colMap.policy_no].textContent || '').trim();
+                if ('registration'  in colMap && tds[colMap.registration])
+                    result.registration  = (tds[colMap.registration].textContent  || '').trim();
+                if ('engine'       in colMap && tds[colMap.engine])
+                    result.engine        = (tds[colMap.engine].textContent       || '').trim();
+                if ('chassis'      in colMap && tds[colMap.chassis])
+                    result.chassis       = (tds[colMap.chassis].textContent      || '').trim();
+                if ('proposal'     in colMap && tds[colMap.proposal])
+                    result.proposal      = (tds[colMap.proposal].textContent     || '').trim();
+                if ('policy_no'    in colMap && tds[colMap.policy_no])
+                    result.policy_in_row = (tds[colMap.policy_no].textContent    || '').trim();
+                if ('policy_start' in colMap && tds[colMap.policy_start])
+                    result.policy_start  = (tds[colMap.policy_start].textContent || '').trim();
+                if ('policy_end'   in colMap && tds[colMap.policy_end])
+                    result.policy_end    = (tds[colMap.policy_end].textContent   || '').trim();
                 break;
             }
             if (result.engine || result.chassis || result.proposal) return result;
@@ -443,7 +579,7 @@ async def download_policy_pdf(page, policy, is_first=True):
         return result;
     }""")
     log("info", f"  Scrape debug: {scraped.get('debug','')}")
-    log("info", f"  Scraped — engine:'{scraped.get('engine','')}' chassis:'{scraped.get('chassis','')}' proposal:'{scraped.get('proposal','')}' policy_in_row:'{scraped.get('policy_in_row','')}'")
+    log("info", f"  Scraped — reg:'{scraped.get('registration','')}' engine:'{scraped.get('engine','')}' chassis:'{scraped.get('chassis','')}' proposal:'{scraped.get('proposal','')}' start:'{scraped.get('policy_start','')}' end:'{scraped.get('policy_end','')}' policy_in_row:'{scraped.get('policy_in_row','')}'")
 
     # CRITICAL: verify the scraped row belongs to THIS policy number.
     # If the page was slow and still shows the previous policy's results,
@@ -455,16 +591,22 @@ async def download_policy_pdf(page, policy, is_first=True):
 
     if not data_is_correct and (scraped.get("engine") or scraped.get("chassis")):
         log("warn", f"  STALE DATA DETECTED — table shows '{policy_in_row}' but current is '{policy_no_norm}' — saving empty to prevent carry-over")
-        scraped["engine"]   = ""
-        scraped["chassis"]  = ""
-        scraped["proposal"] = ""
+        scraped["registration"] = ""
+        scraped["engine"]       = ""
+        scraped["chassis"]      = ""
+        scraped["proposal"]     = ""
+        scraped["policy_start"] = ""
+        scraped["policy_end"]   = ""
 
     # Save to Excel immediately — status "In Progress" marks it started
     update_row(
         policy["row"], policy["status_col"], "In Progress",
+        registration=scraped.get("registration", ""),
         engine=scraped.get("engine", ""),
         chassis=scraped.get("chassis", ""),
-        proposal=scraped.get("proposal", "")
+        proposal=scraped.get("proposal", ""),
+        policy_start=scraped.get("policy_start", ""),
+        policy_end=scraped.get("policy_end", "")
     )
 
     # 5. Scroll table right to reveal Policy PDF column
@@ -582,6 +724,41 @@ async def download_policy_pdf(page, policy, is_first=True):
                     pdf_th_el = th
                     break
 
+            # Before reading coordinates, wait for the PDF cell in the target
+            # row to actually contain something clickable (icon/button/link).
+            # An empty <td></td> will give valid coordinates but the click will
+            # land on blank space and nothing downloads. Poll for up to 10s.
+            if pdf_th_el:
+                for _pic in range(20):
+                    cell_has_icon = await pdf_th_el.evaluate("""(th) => {
+                        const table = th.closest('table');
+                        if (!table) return false;
+                        // Column index of Policy PDF
+                        const ths = Array.from(table.querySelectorAll('th'));
+                        const colIdx = ths.indexOf(th);
+                        if (colIdx < 0) return false;
+                        // First data row's cell at that column
+                        const firstRow = table.querySelector('tbody tr') || table.querySelector('tr:nth-child(2)');
+                        if (!firstRow) return false;
+                        const tds = firstRow.querySelectorAll('td');
+                        if (colIdx >= tds.length) return false;
+                        const cell = tds[colIdx];
+                        // Cell is 'ready' if it has an img, svg, button, or a
+                        // non-whitespace child of nonzero size.
+                        const clickable = cell.querySelector('img, svg, button, a, i[class], [role="button"]');
+                        if (clickable) {
+                            const r = clickable.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) return true;
+                        }
+                        return false;
+                    }""")
+                    if cell_has_icon:
+                        log("info", f"  Policy PDF icon present in row (attempt {_pic+1})")
+                        break
+                    await page.wait_for_timeout(500)
+                else:
+                    log("warn", "  Policy PDF icon never appeared in row — clicking anyway")
+
             icon_coords = None
             if pdf_th_el:
                 await pdf_th_el.scroll_into_view_if_needed()
@@ -622,10 +799,11 @@ async def download_policy_pdf(page, policy, is_first=True):
                 if failure:
                     log("warn", f"  Download failed: {failure}")
                 else:
-                    # CDP-connected Chrome saves the file directly to DOC_DIR
-                    # with a UUID filename via setDownloadBehavior set at startup.
-                    # Wait for such a file to appear (non-.pdf, size > 1024),
-                    # then rename it to the correct policy filename.
+                    # Strategy A: wait for the CDP-named UUID file to appear in DOC_DIR.
+                    # Strategy B: if that never appears (common on the 1st download
+                    #            before setDownloadBehavior has fully propagated),
+                    #            fall back to Playwright's dl.save_as() — BUT do so
+                    #            only after giving CDP its chance first.
                     found_file = None
                     for _fw in range(60):   # up to 30s
                         # Look for any new file in DOC_DIR (UUID name, no extension)
@@ -642,12 +820,44 @@ async def download_policy_pdf(page, policy, is_first=True):
                         await page.wait_for_timeout(500)
 
                     if not found_file:
-                        # Last resort: try save_as
-                        log("info", "  No UUID file found — trying save_as")
-                        await dl.save_as(str(pdf_path))
-                        await page.wait_for_timeout(2000)
-                        if pdf_path.exists() and pdf_path.stat().st_size > 1024:
-                            found_file = pdf_path
+                        # Strategy B: ask Playwright for the download path.
+                        # dl.path() blocks until the download finishes, so we get
+                        # the real file even if CDP setDownloadBehavior was late.
+                        log("info", "  No UUID file found — asking Playwright for download path")
+                        try:
+                            pw_path = await dl.path()
+                            if pw_path:
+                                import shutil as _sh
+                                pw_p = Path(pw_path)
+                                # Wait for Playwright to finish writing
+                                for _pw_wait in range(20):
+                                    if pw_p.exists() and pw_p.stat().st_size > 1024:
+                                        break
+                                    await page.wait_for_timeout(500)
+                                if pw_p.exists() and pw_p.stat().st_size > 1024:
+                                    _sh.copy(str(pw_p), str(pdf_path))
+                                    log("ok", f"  Copied from Playwright path: {pw_p.name} ({pw_p.stat().st_size:,} bytes)")
+                                    found_file = pdf_path
+                                else:
+                                    log("info", f"  Playwright path exists={pw_p.exists()} size={pw_p.stat().st_size if pw_p.exists() else 0}")
+                        except Exception as _pe:
+                            log("info", f"  dl.path() failed: {_pe}")
+
+                        # Strategy C (last resort): save_as to target path
+                        if not found_file:
+                            log("info", "  Trying dl.save_as() as last resort")
+                            try:
+                                await dl.save_as(str(pdf_path))
+                            except Exception as _se:
+                                log("info", f"  save_as failed: {_se}")
+                            # Wait longer for save_as — on slow first downloads it
+                            # can take 5-10 seconds to actually land on disk.
+                            for _sa_wait in range(20):   # up to 10s
+                                if pdf_path.exists() and pdf_path.stat().st_size > 1024:
+                                    break
+                                await page.wait_for_timeout(500)
+                            if pdf_path.exists() and pdf_path.stat().st_size > 1024:
+                                found_file = pdf_path
 
                     if found_file and found_file != pdf_path:
                         found_file.rename(pdf_path)
@@ -676,9 +886,12 @@ async def download_policy_pdf(page, policy, is_first=True):
     status = "Downloaded" if download_done else "Failed"
     update_row(
         policy["row"], policy["status_col"], status,
+        registration=scraped.get("registration", ""),
         engine=scraped.get("engine", ""),
         chassis=scraped.get("chassis", ""),
-        proposal=scraped.get("proposal", "")
+        proposal=scraped.get("proposal", ""),
+        policy_start=scraped.get("policy_start", ""),
+        policy_end=scraped.get("policy_end", "")
     )
     return download_done
 
@@ -711,6 +924,10 @@ async def main():
         browser, page = await connect_to_chrome(p)
 
         # Set download path via CDP
+        # IMPORTANT: do this BEFORE any page interaction so Chrome has the setting
+        # registered by the time the first download click happens. We also attach
+        # the CDP session to the browser-level target (not just the page) so that
+        # new tabs/popups triggered by a PDF click also honour the download path.
         try:
             cdp = await page.context.new_cdp_session(page)
             await cdp.send("Browser.setDownloadBehavior", {
@@ -718,6 +935,12 @@ async def main():
                 "downloadPath": str(DOC_DIR.resolve()),
                 "eventsEnabled": True
             })
+            # Give CDP a moment to register the setting. Without this small wait
+            # the first download click often completes BEFORE Chrome has applied
+            # the download-path override, causing the file to either land in the
+            # user's default Downloads folder or get reported as failed. Second
+            # and later downloads always work because the setting is active by then.
+            await page.wait_for_timeout(1500)
             log("ok", f"Download path: {DOC_DIR.resolve()}")
         except Exception as e:
             log("warn", f"Could not set download path: {e}")
